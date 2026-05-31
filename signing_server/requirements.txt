@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+pydantic
+bip-utils
+tronpy>=0.3.0
+python-dotenv

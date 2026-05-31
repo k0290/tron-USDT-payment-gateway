@@ -1,0 +1,72 @@
+# --- Configuration & Secrets ---
+# 忽略所有 .env 文件，这是最重要的安全措施！
+# .env.example 应该被提交到版本库作为模板。
+.env.*
+!.env.example
+
+# --- Python ---
+# 忽略Python的缓存文件和字节码文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# --- Virtual Environments ---
+# 忽略常见的虚拟环境目录
+venv/
+.venv/
+env/
+ENV/
+venv.bak/
+.env/
+
+# --- IDE & Editor specific files ---
+# Visual Studio Code
+.vscode/*
+# 如果你想共享推荐的插件或设置，可以取消下面几行的注释
+# !.vscode/extensions.json
+# !.vscode/settings.json
+
+# PyCharm
+.idea/
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# --- Testing & Coverage ---
+# 忽略测试工具生成的缓存和报告
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+nosetests.xml
+coverage.xml
+
+# --- Build & Distribution ---
+# 忽略打包和分发时生成的目录
+build/
+dist/
+*.egg-info/
+sdist/
+wheelhouse/
+pip-wheel-metadata/
+
+# --- OS-specific files ---
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+
+# --- Logs ---
+# 忽略日志文件和目录
+*.log
+logs/
+log/
+
+node_modules
