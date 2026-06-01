@@ -30,6 +30,7 @@ from tron_payment import (
     WalletService,
     BlockchainMonitor,
     BalanceSyncService,
+    SweepService,
     PaymentEvent,
 )
 
@@ -41,8 +42,12 @@ logger = logging.getLogger(__name__)
 wallet_service = None
 blockchain_monitor = None
 balance_service = None
+sweep_service = None
 db = None
 payment_config = None
+
+# Sweep interval (seconds) between sweep runs
+SWEEP_INTERVAL_SECONDS = 3600
 
 # 第三方支付对接配置（从全局 .env 读取）
 MERCHANT_KEY = "vtxVKIXq95VC5ilPwd2W6jCIVfqFNoUc"
@@ -480,10 +485,34 @@ async def run_balance_sync():
         await asyncio.sleep(300)  # 每5分钟
 
 
+async def run_sweep_service():
+    """后台任务：将收款地址 USDT 归集到冷钱包（需 signing_server + .env 配置）"""
+    if sweep_service is None:
+        return
+    if not await sweep_service.check_signing_service():
+        logger.warning("归集任务未启动：签名服务或冷钱包未配置")
+        return
+
+    await asyncio.sleep(10)
+
+    while True:
+        try:
+            await sweep_service.sweep_funds(
+                min_amount=payment_config.SWEEP_MIN_AMOUNT_USDT
+            )
+        except asyncio.CancelledError:
+            break
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.RequestError) as e:
+            logger.warning(f"归集服务连接失败（签名服务是否已启动？）: {e}")
+        except Exception as e:
+            logger.error(f"归集错误: {e}", exc_info=True)
+        await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    global wallet_service, blockchain_monitor, balance_service, db, payment_config
+    global wallet_service, blockchain_monitor, balance_service, sweep_service, db, payment_config
 
     # 启动时初始化
     logger.info("初始化支付系统...")
@@ -501,6 +530,7 @@ async def lifespan(app: FastAPI):
     #   SIGNING_SERVICE_URL=http://localhost:9090
     #   TRX_SOURCE_PRIVATE_KEY=your_hex_private_key_here
     #   TRONGRID_API_KEY=your_api_key_here
+    #   SWEEP_MIN_AMOUNT_USDT=10.0
     
     try:
         config = PaymentConfig()
@@ -510,7 +540,6 @@ async def lifespan(app: FastAPI):
         logger.error(f"❌ 配置加载失败: {e}")
         logger.error("请创建 .env 文件并配置必需的变量")
         raise
-
     # 数据库
     mongo_client = AsyncIOMotorClient("mongodb://localhost:27017")
     db = mongo_client.payment_system
@@ -520,9 +549,29 @@ async def lifespan(app: FastAPI):
     blockchain_monitor = BlockchainMonitor(config, db, on_payment_confirmed)
     balance_service = BalanceSyncService(config, db)
 
+    sweep_available = bool(
+        config.COLD_WALLET_ADDRESS
+        and config.SIGNING_SERVICE_URL
+        and config.TRX_SOURCE_PRIVATE_KEY
+    )
+    if sweep_available:
+        sweep_service = SweepService(config, db)
+        logger.info(
+            f"✅ 归集服务已启用 → {config.COLD_WALLET_ADDRESS}, "
+            f"签名服务 {config.SIGNING_SERVICE_URL}"
+        )
+    else:
+        sweep_service = None
+        logger.info(
+            "归集服务未启用（需 COLD_WALLET_ADDRESS, SIGNING_SERVICE_URL, TRX_SOURCE_PRIVATE_KEY）"
+        )
+
     # 启动后台任务
     monitor_task = asyncio.create_task(run_blockchain_monitor())
     balance_task = asyncio.create_task(run_balance_sync())
+    sweep_task = None
+    if sweep_service is not None:
+        sweep_task = asyncio.create_task(run_sweep_service())
 
     logger.info("✅ 支付系统初始化完成")
 
@@ -531,6 +580,12 @@ async def lifespan(app: FastAPI):
     # 关闭时清理
     monitor_task.cancel()
     balance_task.cancel()
+    if sweep_task is not None:
+        sweep_task.cancel()
+    tasks = [monitor_task, balance_task]
+    if sweep_task is not None:
+        tasks.append(sweep_task)
+    await asyncio.gather(*tasks, return_exceptions=True)
     logger.info("⏹ 支付系统已停止")
 
 

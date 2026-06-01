@@ -41,6 +41,12 @@ class PaymentConfig(BaseSettings):
         None, description="TRX 源钱包地址（可选，用于验证）"
     )
 
+    SWEEP_MIN_AMOUNT_USDT: float = Field(
+        default=10.0,
+        gt=0,
+        description="归集最小金额（USDT），地址余额低于此值不归集",
+    )
+
     # USDT 精度
     USDT_DECIMALS: int = Field(default=1_000_000, description="USDT 精度（6位小数）")
 
