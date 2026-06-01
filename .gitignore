@@ -4,6 +4,7 @@
 !.env.example
 signing_server/.env
 signing_server/.env.*
+!signing_server/.env.example
 
 # Python
 __pycache__/
