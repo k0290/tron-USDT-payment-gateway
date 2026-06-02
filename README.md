@@ -88,9 +88,18 @@ python key_management/derive_address.py
 
 测试网与主网 **必须成对使用**，不要混配。
 
-#### 步骤 F：归集 TRX 钱包（仅归集）
+#### 步骤 F：运营钱包 `TRX_SOURCE_PRIVATE_KEY`（仅归集）
 
-在 `.env` 中设置 `TRX_SOURCE_PRIVATE_KEY`（hex，无 `0x`）及可选的 `TRX_SOURCE_ADDRESS`，用于能量委托手续费。
+在 `.env` 中设置 **运营钱包私钥**（hex，无 `0x` 前缀）。该钱包与收款 HD 钱包 **无关**，专门用于归集时的 **能量委托** 和 **激活新地址**。链上地址由私钥自动推导，**无需** 单独配置地址字段。
+
+```env
+TRX_SOURCE_PRIVATE_KEY=your_hex_private_key
+```
+
+运营钱包需具备：
+
+- 足够 **TRX**（激活地址时每个新收款地址约 **0.1 TRX** + 少量带宽）
+- 足够 **冻结用于 Energy 的 TRX**（见下文 **「Sweep 归集与 Energy 委托」**）
 
 #### 配置对照表
 
@@ -115,6 +124,94 @@ python key_management/derive_address.py
 
 收款地址 index=1,2,3...     ← ACCOUNT_XPUB 派生（每笔订单一个）
 ```
+
+---
+
+## ⚡ Sweep 归集与 Energy 委托（`TRX_SOURCE_PRIVATE_KEY`）
+
+`SweepService`（`tron_payment/sweep.py`）把各 **收款地址** 上的 USDT 转到 `COLD_WALLET_ADDRESS`。收款地址通常 **只有 USDT、没有 TRX**，而 TRC20 转账需要 **Energy**（或燃烧 TRX）。若每次归集都给每个地址转 TRX 当手续费，成本高且难管理。
+
+本 SDK 的做法：用 `.env` 中的 **`TRX_SOURCE_PRIVATE_KEY`** 加载一台 **运营钱包**，由它 **冻结 TRX 获得 Energy → 临时委托给收款地址 → 收款地址发 USDT → 撤销委托**，同一笔冻结 TRX 可反复用于多笔归集。
+
+### 三个钱包各做什么
+
+| 钱包 | 配置 | 归集中的角色 |
+|------|------|----------------|
+| 收款地址 | 由 `ACCOUNT_XPUB` 派生 | 持有 USDT；**交易发起方**（owner） |
+| 运营钱包 | `TRX_SOURCE_PRIVATE_KEY` | 激活地址、冻结/委托/撤销 **Energy** |
+| 冷钱包 | `COLD_WALLET_ADDRESS` | USDT **到账方** |
+| 签名 | `signing_server` 助记词 | 对收款地址的 tx **签名**（与 xpub 同种子） |
+
+运营钱包的 `T...` 地址 **由私钥在代码里自动推导**，不需要在 `.env` 里再写地址。
+
+### Tron Energy 委托是什么
+
+1. **冻结（Freeze / Stake）** — 运营钱包把 TRX 冻结为 **Energy** 资源（Stake 2.0：`freeze_balance`，`resource=ENERGY`）。
+2. **委托（Delegate）** — 运营钱包把一部分 **可用冻结 Energy** **借给** 收款地址使用（`delegate_resource`，`lock=False` 表示之后可撤销）。
+3. **使用** — 收款地址发起 USDT `transfer` 时，优先消耗 **委托到自己名下的 Energy**，而不是燃烧 TRX。
+4. **撤销（Undelegate）** — 归集完成后，运营钱包 **收回** 委托，Energy 额度可给下一个收款地址再用。
+
+委托本身 **不消耗** 被冻结的 TRX 本金，只消耗少量 **带宽** 发链上交易；真正被「用掉」的是 Energy 点数。
+
+### 代码中的常量
+
+| 常量 | 值 | 含义 |
+|------|-----|------|
+| `DELEGATED_ENERGY_SUN` | 80_000_000 | 每次向收款地址委托约 **80k Energy** |
+| `USDT_TRANSFER_FEE_LIMIT_SUN` | 15_000_000 | USDT 交易 **fee_limit** 上限 15 TRX（Energy 不够时才可能烧 TRX） |
+| `ADDRESS_ACTIVATION_AMOUNT_SUN` | 100_000 | 未激活地址先发 **0.1 TRX** 激活 |
+
+单笔 USDT 转账常见消耗约 **65k Energy**（冷钱包已有 USDT 时）；首次收 USDT 可能约 **130k**。Energy 消耗与 **USDT 数量无关**。
+
+### 单笔归集详细步骤（`sweep_funds`）
+
+对每个 USDT 余额 ≥ `SWEEP_MIN_AMOUNT_USDT` 的收款地址：
+
+```
+┌─────────────────────┐
+│ TRX_SOURCE 运营钱包  │  ← TRX_SOURCE_PRIVATE_KEY
+└──────────┬──────────┘
+           │
+           │ ① 若收款地址未上链：转 0.1 TRX 激活 (_activate_address)
+           │
+           │ ② 若冻结 Energy 不足：freeze_balance 追加冻结 (_ensure_frozen_energy)
+           │
+           │ ③ delegate_resource → 收款地址 (~80k Energy) (_delegate_energy)
+           ▼
+┌─────────────────────┐
+│ 收款地址 (index=N)   │  ← 仅有 USDT，现拥有委托来的 Energy
+└──────────┬──────────┘
+           │
+           │ ④ 构建 USDT.transfer(收款地址 → 冷钱包)
+           │ ⑤ signing_server 按 address_index 签名 txid
+           │ ⑥ 广播交易
+           │
+           ▼
+┌─────────────────────┐
+│ COLD_WALLET_ADDRESS │
+└─────────────────────┘
+           │
+           │ ⑦ undelegate_resource：运营钱包收回 Energy (_undelegate_energy)
+           │ ⑧ 更新 MongoDB 地址余额
+           ▼
+        下一地址
+```
+
+所有需要 **运营钱包签名** 的步骤（激活、冻结、委托、撤销）都用 `TRX_SOURCE_PRIVATE_KEY` 本地签名并广播；只有 **USDT 转出** 那一步用 **signing_server** 里与收款 index 匹配的私钥签名。
+
+### 运营钱包如何准备
+
+1. 新建 **独立** Tron 钱包，导出 hex 私钥写入 `TRX_SOURCE_PRIVATE_KEY`（勿与 `signing_server` 助记词混用，除非刻意同一账户）。
+2. 转入足够 **liquid TRX**：激活新地址（约 0.1 TRX/个）、委托/撤销/冻结的带宽。
+3. 转入并 **冻结 TRX 换 Energy**（可在 TronLink 手动 Stake，或让 SDK 在 `_ensure_frozen_energy` 中自动冻结）。冻结量建议 **大于** 单次委托 × 并发归集数；代码在委托失败时会尝试 **多冻结 20% 缓冲** 后重试。
+4. 监控 Tronscan：运营地址的 **Energy 余额**、**Frozen TRX**、liquid TRX 是否够用。
+
+### 与「直接给收款地址打 TRX」对比
+
+| 方式 | 优点 | 缺点 |
+|------|------|------|
+| **Energy 委托（本 SDK）** | 同一笔冻结 TRX 可反复用；单笔归集 TRX 消耗低 | 实现复杂；需维护运营钱包冻结额度 |
+| **每次转 TRX 当 gas** | 简单 | 每个地址都要打 TRX；剩余 TRX 散落各地址 |
 
 ---
 

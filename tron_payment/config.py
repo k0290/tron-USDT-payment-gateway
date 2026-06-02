@@ -35,10 +35,7 @@ class PaymentConfig(BaseSettings):
 
     # TRX 源钱包配置（用于向支付地址发送 TRX 作为手续费）
     TRX_SOURCE_PRIVATE_KEY: Optional[str] = Field(
-        None, description="TRX 源钱包私钥（hex格式，用于发送 TRX 手续费）"
-    )
-    TRX_SOURCE_ADDRESS: Optional[str] = Field(
-        None, description="TRX 源钱包地址（可选，用于验证）"
+        None, description="TRX 源钱包私钥（hex格式，用于能量委托与地址激活）"
     )
 
     SWEEP_MIN_AMOUNT_USDT: float = Field(
