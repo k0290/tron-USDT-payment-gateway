@@ -43,6 +43,11 @@ class SignedTxResponse(BaseModel):
     )
 
 
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
+
 @app.post("/sign-transaction", response_model=SignedTxResponse)
 async def sign_transaction(payload: UnsignedTxPayload):
     logger.info(f"收到对索引 {payload.address_index} 的签名请求，txID: {payload.txid}")

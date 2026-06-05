@@ -10,14 +10,15 @@ import asyncio
 import httpx
 import tronpy
 from tronpy import AsyncTron
-from tronpy.providers.async_http import AsyncHTTPProvider
 from tronpy.keys import PrivateKey
 from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from bip_utils import Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
 
 from .config import PaymentConfig
+from .energy_rent import EnergyRentService
 from .exceptions import SweepError
+from .tron_helpers import build_async_tron_provider, get_usdt_contract
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,9 @@ class SweepService:
         """
         self.config = config
         self.db = db
+        self.energy_rent = EnergyRentService(config)
+        self._cached_usdt_contract = None
+        self._cached_usdt_contract_address = None
 
         if not self.config.COLD_WALLET_ADDRESS:
             logger.warning("⚠️ COLD_WALLET_ADDRESS 未配置，归集功能不可用")
@@ -70,12 +74,60 @@ class SweepService:
 
         logger.info("✅ SweepService 初始化成功")
 
+    async def _load_usdt_contract(self, client: AsyncTron):
+        """加载并缓存 USDT 合约，避免每次 sweep 重复请求 getcontract。"""
+        contract_address = self.config.USDT_CONTRACT_ADDRESS
+        if (
+            self._cached_usdt_contract is not None
+            and self._cached_usdt_contract_address == contract_address
+        ):
+            return self._cached_usdt_contract
+
+        contract = await get_usdt_contract(client, contract_address)
+        self._cached_usdt_contract = contract
+        self._cached_usdt_contract_address = contract_address
+        return contract
+
+    async def _ping_signing_service(self) -> bool:
+        """探测签名服务是否在线（优先 GET /health，回退 GET /docs）。"""
+        base_url = self.config.SIGNING_SERVICE_URL.rstrip("/")
+        probe_urls = [f"{base_url}/health", f"{base_url}/docs"]
+
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                for probe_url in probe_urls:
+                    try:
+                        response = await client.get(probe_url)
+                    except httpx.HTTPError:
+                        continue
+
+                    if response.status_code != 200:
+                        continue
+
+                    if probe_url.endswith("/health"):
+                        if response.json().get("status") == "ok":
+                            return True
+                        continue
+
+                    return True
+        except httpx.HTTPError as e:
+            logger.warning(
+                f"签名服务不可达 ({base_url})，请先启动 signing_server: {e}"
+            )
+            return False
+
+        logger.warning(
+            f"签名服务不可达 ({base_url})，请先运行: "
+            "cd signing_server && uvicorn main:app --host 127.0.0.1 --port 9090"
+        )
+        return False
+
     async def check_signing_service(self) -> bool:
         """
-        检查签名服务是否配置
+        检查签名服务是否已配置且在线。
 
         Returns:
-            bool: 是否已配置
+            bool: 是否可用
         """
         if not self.config.SIGNING_SERVICE_URL:
             logger.warning(
@@ -89,7 +141,10 @@ class SweepService:
             )
             return False
 
-        logger.info(f"✅ 签名服务已配置: {self.config.SIGNING_SERVICE_URL}")
+        if not await self._ping_signing_service():
+            return False
+
+        logger.info(f"✅ 签名服务在线: {self.config.SIGNING_SERVICE_URL}")
         logger.info(f"✅ 冷钱包地址: {self.config.COLD_WALLET_ADDRESS}")
         return True
 
@@ -556,6 +611,97 @@ class SweepService:
             # 撤销失败不算严重错误，不影响主流程
             return False
 
+    async def _rent_energy_for_address(
+        self,
+        address: str,
+        client: AsyncTron,
+        http_client: httpx.AsyncClient,
+    ) -> bool:
+        """
+        在转账前向收款地址租用能量（tronenergy.market）。
+
+        子钱包在收到 USDT 时已被激活，通常无需额外激活；若未激活且配置了运营钱包，
+        则先用运营钱包激活后再租用。
+
+        Args:
+            address: 收款地址（子钱包，USDT 转账发起方）
+            client: Tron 客户端
+            http_client: HTTP 客户端
+
+        Returns:
+            bool: 能量是否就绪
+        """
+        # 租用前确保地址已激活（未激活无法接收委托能量）
+        try:
+            await client.get_account(address)
+        except tronpy.exceptions.AddressNotFound:
+            logger.info(f"地址 {address} 未激活，租用前先激活...")
+            if not self.config.TRX_SOURCE_PRIVATE_KEY:
+                logger.error(
+                    "地址未激活且未配置 TRX_SOURCE_PRIVATE_KEY，无法激活，跳过租用"
+                )
+                return False
+            if not await self._activate_address(address, client):
+                logger.error(f"激活地址 {address} 失败，跳过租用")
+                return False
+            await asyncio.sleep(2)
+
+        required_energy = self.energy_rent.required_energy_for_sweep()
+        available_energy = await self.energy_rent.get_available_energy(
+            address, client
+        )
+
+        if available_energy >= required_energy:
+            logger.info(
+                f"地址 {address} 已有足够能量 "
+                f"({available_energy}/{required_energy})，无需租用"
+            )
+            return True
+
+        energy_to_rent = required_energy - available_energy
+        logger.info(
+            f"地址 {address} 当前能量 {available_energy}，"
+            f"需补足 {energy_to_rent}（目标 {required_energy}）"
+        )
+
+        if not await self.energy_rent.rent_energy(
+            address, client, http_client, amount=energy_to_rent
+        ):
+            return False
+
+        return await self.energy_rent.wait_for_energy(
+            address, client, required_energy=required_energy
+        )
+
+    async def _acquire_energy(
+        self,
+        address: str,
+        client: AsyncTron,
+        http_client: httpx.AsyncClient,
+    ) -> bool:
+        """
+        按配置的 ENERGY_MODE 为收款地址准备能量。
+
+        - rent: 从 tronenergy.market 租用（失败时可回退到 delegate）
+        - delegate: 运营钱包冻结并委托能量
+
+        Returns:
+            bool: 能量是否就绪
+        """
+        mode = (self.config.ENERGY_MODE or "delegate").lower()
+
+        if mode == "rent":
+            if await self._rent_energy_for_address(address, client, http_client):
+                return True
+            logger.warning(f"向 {address} 租用能量失败")
+            if self.config.RENT_FALLBACK_TO_DELEGATE and self.config.TRX_SOURCE_PRIVATE_KEY:
+                logger.info("回退到冻结/委托方式获取能量...")
+                return await self._delegate_energy(address, client)
+            return False
+
+        # 默认：冻结/委托
+        return await self._delegate_energy(address, client)
+
     async def sweep_funds(self, min_amount: float = None):
         """
         执行资金归集
@@ -591,18 +737,13 @@ class SweepService:
 
         logger.info(f"开始执行地址资金归集任务（最小金额: {min_amount} USDT）...")
 
-        # 初始化 Tron 客户端
-        headers = {"TRON-PRO-API-KEY": self.config.TRONGRID_API_KEY or ""}
-        async with httpx.AsyncClient(headers=headers, timeout=30.0) as http_client:
-            provider = AsyncHTTPProvider(
-                endpoint_uri=self.config.TRONGRID_API_URL, client=http_client
-            )
+        # 初始化 Tron 客户端（api_key 必须传给 AsyncHTTPProvider，否则会用共享 Key 导致 429）
+        async with httpx.AsyncClient(timeout=30.0) as http_client:
+            provider = build_async_tron_provider(self.config, http_client)
             client = AsyncTron(provider=provider)
 
             try:
-                usdt_contract = await client.get_contract(
-                    self.config.USDT_CONTRACT_ADDRESS
-                )
+                usdt_contract = await self._load_usdt_contract(client)
             except Exception as e:
                 logger.error(f"初始化 Tron 客户端或合约失败: {e}", exc_info=True)
                 return
@@ -619,12 +760,14 @@ class SweepService:
                     continue
 
                 try:
-                    # 检查 USDT 余额
+                    # 检查 USDT 余额（地址较多时限流，降低 TronGrid 429 概率）
                     usdt_balance_raw = await usdt_contract.functions.balanceOf(address)
+                    await asyncio.sleep(0.15)
                     if (
                         usdt_balance_raw is None
                         or int(usdt_balance_raw) < min_amount_raw
                     ):
+                        logger.info(f"✅ 地址 {address} 的 USDT 余额: {int(usdt_balance_raw) / self.config.USDT_DECIMALS}")
                         continue
 
                     usdt_balance = int(usdt_balance_raw) / self.config.USDT_DECIMALS
@@ -634,21 +777,25 @@ class SweepService:
                         f"准备归集到冷钱包"
                     )
 
-                    # 检查是否配置了主钱包（用于委托能量）
+                    energy_mode = (self.config.ENERGY_MODE or "delegate").lower()
+
+                    # 委托模式必须配置运营钱包；租用模式可用 API Key 信用额度付款
                     if not self.config.TRX_SOURCE_PRIVATE_KEY:
                         logger.error(
                             f"未配置 TRX_SOURCE_PRIVATE_KEY，无法委托能量。"
-                            f"请配置主钱包私钥以使用能量委托功能。"
+                            f"请配置主钱包私钥，或将 ENERGY_MODE 设为 'rent'。"
                         )
                         continue
 
-                    # 委托能量到目标地址（代替发送 TRX）
-                    energy_delegated = await self._delegate_energy(address, client)
-                    if not energy_delegated:
-                        logger.error(f"向地址 {address} 委托能量失败，跳过归集")
+                    # 为目标地址准备能量（租用或委托），代替发送 TRX
+                    energy_ready = await self._acquire_energy(
+                        address, client, http_client
+                    )
+                    if not energy_ready:
+                        logger.error(f"为地址 {address} 准备能量失败，跳过归集")
                         continue
 
-                    # 等待能量委托生效
+                    # 等待能量生效
                     await asyncio.sleep(2)
 
                     # 如果当前地址就是冷钱包，跳过
@@ -666,12 +813,12 @@ class SweepService:
                         http_client,
                     )
 
-                    # 撤销能量委托（释放能量以便重复使用）
-                    # 无论归集成功与否，都尝试撤销能量委托
-                    await self._undelegate_energy(address, client)
-
-                    # 等待撤销完成，以便能量可以用于下一个地址
-                    await asyncio.sleep(2)
+                    # 委托模式：撤销能量委托（释放能量以便重复使用）。
+                    # 租用模式：能量由市场出借方委托，到期自动回收，无需也无法撤销。
+                    if energy_mode != "rent":
+                        await self._undelegate_energy(address, client)
+                        # 等待撤销完成，以便能量可以用于下一个地址
+                        await asyncio.sleep(2)
 
                     if success:
                         swept_count += 1

@@ -52,7 +52,7 @@ class PaymentConfig(BaseSettings):
 
     # 能量获取方式：'delegate'（冻结/委托，默认）或 'rent'（从 tronenergy.market 租用）
     ENERGY_MODE: str = Field(
-        default="delegate",
+        default="rent",
         description="能量获取方式：'delegate' 冻结委托 / 'rent' 市场租用",
     )
 
@@ -76,7 +76,7 @@ class PaymentConfig(BaseSettings):
     RENT_ENERGY_AMOUNT: int = Field(
         default=65_000,
         gt=0,
-        description="每次租用的能量点数（单笔 USDT 转账约需 65000）",
+        description="单笔 USDT 归集所需能量；实际租用 = 此值减去地址已有可用能量",
     )
     RENT_DURATION_SECONDS: int = Field(
         default=600,

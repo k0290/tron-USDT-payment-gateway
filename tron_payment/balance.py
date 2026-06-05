@@ -9,11 +9,11 @@ import logging
 import httpx
 import tronpy
 from tronpy import AsyncTron
-from tronpy.providers.async_http import AsyncHTTPProvider
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from .config import PaymentConfig
 from .exceptions import BalanceError
+from .tron_helpers import build_async_tron_provider, get_usdt_contract
 
 logger = logging.getLogger(__name__)
 
@@ -48,16 +48,14 @@ class BalanceSyncService:
         """
         logger.info("开始同步地址余额...")
 
-        headers = {'TRON-PRO-API-KEY': self.config.TRONGRID_API_KEY or ''}
-        async with httpx.AsyncClient(headers=headers, timeout=30.0) as http_client:
-            provider = AsyncHTTPProvider(
-                endpoint_uri=self.config.TRONGRID_API_URL,
-                client=http_client
-            )
+        async with httpx.AsyncClient(timeout=30.0) as http_client:
+            provider = build_async_tron_provider(self.config, http_client)
             client = AsyncTron(provider=provider)
 
             try:
-                usdt_contract = await client.get_contract(self.config.USDT_CONTRACT_ADDRESS)
+                usdt_contract = await get_usdt_contract(
+                    client, self.config.USDT_CONTRACT_ADDRESS
+                )
             except Exception as e:
                 logger.error(f"初始化合约失败: {e}", exc_info=True)
                 return
