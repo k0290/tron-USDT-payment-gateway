@@ -16,6 +16,7 @@ import json
 import logging
 import hashlib
 import httpx
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -86,6 +87,35 @@ def _format_datetime(value) -> str:
     return str(value)
 
 
+def _parse_datetime(value) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        try:
+            if value.endswith("Z"):
+                value = value[:-1] + "+00:00"
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            return None
+    else:
+        return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _invoice_payment_deadline_ms(invoice_doc: dict) -> Optional[int]:
+    """支付截止时间（毫秒时间戳）= created_at + EXPIRE_TIME_WINDOW。"""
+    created_at = _parse_datetime(invoice_doc.get("created_at"))
+    if created_at is None or payment_config is None:
+        return None
+    deadline = created_at + timedelta(seconds=payment_config.EXPIRE_TIME_WINDOW)
+    return int(deadline.timestamp() * 1000)
+
+
 def _network_label(trongrid_url: str) -> str:
     url = (trongrid_url or "").lower()
     if "nile" in url:
@@ -107,13 +137,19 @@ def _explorer_address_url(trongrid_url: str, address: str) -> str:
 def _render_payment_page(invoice_doc: dict) -> str:
     status = invoice_doc.get("status", "pending")
     is_paid = status == "paid"
+    is_expired = status == "expired"
     address = invoice_doc.get("address") or ""
     amount = float(invoice_doc.get("amount_due", 0.0) or 0.0)
+    amount_paid = float(invoice_doc.get("amount_paid", 0.0) or 0.0)
+    amount_remaining = max(0.0, amount - amount_paid)
+    is_partial = not is_paid and not is_expired and amount_paid > 0
+    progress_pct = min(100.0, (amount_paid / amount) * 100.0) if amount > 0 else 0.0
     order_id = invoice_doc.get("id") or ""
     merchant_id = invoice_doc.get("merchant_id") or "—"
     merchant_order_id = invoice_doc.get("merchant_order_id") or "—"
     pay_method = invoice_doc.get("pay_method") or "USDT-TRC20"
     created_at = _format_datetime(invoice_doc.get("created_at"))
+    expires_at = _format_datetime(invoice_doc.get("expires_at"))
     paid_at = _format_datetime(invoice_doc.get("paid_at"))
     back_url = invoice_doc.get("back_url") or ""
     txid = invoice_doc.get("txid") or ""
@@ -123,9 +159,17 @@ def _render_payment_page(invoice_doc: dict) -> str:
     explorer_url = _explorer_address_url(trongrid_url, address) if address else "#"
     usdt_contract = payment_config.USDT_CONTRACT_ADDRESS if payment_config else ""
 
-    status_label = "Paid" if is_paid else "Awaiting payment"
-    status_class = "status-paid" if is_paid else "status-pending"
+    if is_paid:
+        status_label = "Paid"
+        status_class = "status-paid"
+    elif is_expired:
+        status_label = "Expired"
+        status_class = "status-expired"
+    else:
+        status_label = "Awaiting payment"
+        status_class = "status-pending"
     amount_display = f"{amount:.2f}"
+    expires_at_ms = _invoice_payment_deadline_ms(invoice_doc)
 
     paid_block = ""
     if is_paid:
@@ -135,6 +179,48 @@ def _render_payment_page(invoice_doc: dict) -> str:
           {"You will be redirected shortly." if back_url else "Thank you."}
         </div>
         """
+
+    expired_block = ""
+    if is_expired:
+        expired_block = f"""
+        <div class="expired-banner">
+          <strong>This payment link has expired.</strong>
+          {"Expired at: " + html.escape(expires_at) if expires_at else "Please create a new order."}
+        </div>
+        """
+
+    countdown_block = ""
+    if not is_paid and not is_expired and expires_at_ms:
+        countdown_block = """
+        <div class="countdown-banner" id="countdown-banner">
+          <span class="countdown-label">Time remaining</span>
+          <span class="countdown-value" id="countdown-value">--:--</span>
+        </div>
+        """
+
+    partial_block = f"""
+        <div class="partial-banner" id="partial-payment-block" style="display: {"block" if is_partial else "none"};">
+          <div class="partial-title">Partial payment received</div>
+          <div class="partial-amounts">
+            <span><strong id="partial-paid">{amount_paid:.2f}</strong> / <span id="partial-due">{amount:.2f}</span> USDT paid</span>
+            <span class="partial-remaining" id="partial-remaining">{amount_remaining:.2f} USDT remaining</span>
+          </div>
+          <div class="progress-bar">
+            <div class="progress-fill" id="partial-progress" style="width: {progress_pct:.1f}%;"></div>
+          </div>
+        </div>
+        """
+
+    if is_partial:
+        hint_text = (
+            f"Send the remaining <strong>{amount_remaining:.2f} USDT</strong> "
+            f"to complete this payment. Already received <strong>{amount_paid:.2f} USDT</strong>."
+        )
+    else:
+        hint_text = (
+            f"Send <strong>exactly {amount_display} USDT</strong> on TRC20 to the address above. "
+            "Wrong amounts may not be matched automatically. Include enough TRX for network fees."
+        )
 
     tx_block = ""
     if txid:
@@ -201,6 +287,80 @@ def _render_payment_page(invoice_doc: dict) -> str:
     }}
     .status-pending {{ background: rgba(245,158,11,.15); color: var(--pending); }}
     .status-paid {{ background: rgba(34,197,94,.15); color: var(--success); }}
+    .status-expired {{ background: rgba(239,68,68,.15); color: #ef4444; }}
+    .countdown-banner {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 16px;
+      padding: 12px 14px;
+      background: rgba(245,158,11,.1);
+      border: 1px solid rgba(245,158,11,.35);
+      border-radius: 10px;
+    }}
+    .countdown-label {{
+      font-size: .85rem;
+      color: var(--muted);
+    }}
+    .countdown-value {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 1.25rem;
+      font-weight: 700;
+      color: var(--pending);
+      letter-spacing: .04em;
+    }}
+    .countdown-banner.urgent {{
+      background: rgba(239,68,68,.1);
+      border-color: rgba(239,68,68,.35);
+    }}
+    .countdown-banner.urgent .countdown-value {{ color: #ef4444; }}
+    .expired-banner {{
+      margin-bottom: 16px;
+      padding: 12px;
+      background: rgba(239,68,68,.12);
+      border: 1px solid rgba(239,68,68,.35);
+      border-radius: 10px;
+      color: #ef4444;
+      font-size: .9rem;
+    }}
+    .partial-banner {{
+      margin-bottom: 16px;
+      padding: 14px;
+      background: rgba(59,130,246,.1);
+      border: 1px solid rgba(59,130,246,.35);
+      border-radius: 10px;
+    }}
+    .partial-title {{
+      font-size: .85rem;
+      font-weight: 600;
+      color: #60a5fa;
+      margin-bottom: 8px;
+    }}
+    .partial-amounts {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      font-size: .9rem;
+      margin-bottom: 10px;
+    }}
+    .partial-remaining {{
+      color: var(--pending);
+      font-weight: 600;
+    }}
+    .progress-bar {{
+      height: 8px;
+      background: rgba(45,58,79,.8);
+      border-radius: 999px;
+      overflow: hidden;
+    }}
+    .progress-fill {{
+      height: 100%;
+      background: linear-gradient(90deg, #3b82f6, #60a5fa);
+      border-radius: 999px;
+      transition: width .4s ease;
+    }}
     .qr-wrap {{
       display: flex;
       justify-content: center;
@@ -299,6 +459,9 @@ def _render_payment_page(invoice_doc: dict) -> str:
   <div class="wrap">
     <div class="card">
       {paid_block}
+      {expired_block}
+      {countdown_block}
+      {partial_block}
       <span class="status {status_class}">{status_label}</span>
       <h1>USDT Payment</h1>
       <p class="subtitle">{html.escape(network)} · {html.escape(pay_method)}</p>
@@ -316,9 +479,8 @@ def _render_payment_page(invoice_doc: dict) -> str:
         <a class="btn btn-secondary" href="{html.escape(explorer_url)}" target="_blank" rel="noopener">View on Tronscan</a>
       </div>
 
-      <div class="hint">
-        Send <strong>exactly {html.escape(amount_display)} USDT</strong> on TRC20 to the address above.
-        Wrong amounts may not be matched automatically. Include enough TRX for network fees.
+      <div class="hint" id="payment-hint">
+        {hint_text}
       </div>
 
       <div class="meta">
@@ -339,6 +501,7 @@ def _render_payment_page(invoice_doc: dict) -> str:
           <span class="meta-value">{html.escape(created_at)}</span>
         </div>
         {"<div class=\"meta-row\"><span class=\"meta-label\">Paid at</span><span class=\"meta-value\">" + html.escape(paid_at) + "</span></div>" if paid_at else ""}
+        {"<div class=\"meta-row\"><span class=\"meta-label\">Expired at</span><span class=\"meta-value\">" + html.escape(expires_at) + "</span></div>" if expires_at else ""}
         {tx_block}
         {"<div class=\"meta-row\"><span class=\"meta-label\">Token contract</span><span class=\"meta-value mono\">" + html.escape(usdt_contract) + "</span></div>" if usdt_contract else ""}
       </div>
@@ -350,6 +513,67 @@ def _render_payment_page(invoice_doc: dict) -> str:
     const orderId = {json.dumps(order_id)};
     const backUrl = {json.dumps(back_url)};
     const isPaid = {"true" if is_paid else "false"};
+    const isExpired = {"true" if is_expired else "false"};
+    const expiresAtMs = {expires_at_ms if expires_at_ms else "null"};
+    const amountDue = {amount};
+
+    function updatePartialPayment(data) {{
+      const paid = Number(data.amountPaid || 0);
+      const due = Number(data.amount || amountDue);
+      const remaining = Math.max(0, due - paid);
+      const block = document.getElementById("partial-payment-block");
+      const hint = document.getElementById("payment-hint");
+
+      if (!block) return;
+
+      if (paid > 0 && paid < due) {{
+        block.style.display = "block";
+        document.getElementById("partial-paid").textContent = paid.toFixed(2);
+        document.getElementById("partial-due").textContent = due.toFixed(2);
+        document.getElementById("partial-remaining").textContent = remaining.toFixed(2) + " USDT remaining";
+        document.getElementById("partial-progress").style.width = Math.min(100, (paid / due) * 100).toFixed(1) + "%";
+        if (hint) {{
+          hint.innerHTML = "Send the remaining <strong>" + remaining.toFixed(2) + " USDT</strong> to complete this payment. Already received <strong>" + paid.toFixed(2) + " USDT</strong>.";
+        }}
+      }} else {{
+        block.style.display = "none";
+      }}
+    }}
+
+    function formatCountdown(ms) {{
+      const total = Math.max(0, Math.floor(ms / 1000));
+      const h = Math.floor(total / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      const s = total % 60;
+      if (h > 0) {{
+        return h + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+      }}
+      return m + ":" + String(s).padStart(2, "0");
+    }}
+
+    function tickCountdown() {{
+      if (!expiresAtMs || isPaid || isExpired) return;
+      const banner = document.getElementById("countdown-banner");
+      const valueEl = document.getElementById("countdown-value");
+      if (!banner || !valueEl) return;
+
+      const left = expiresAtMs - Date.now();
+      if (left <= 0) {{
+        valueEl.textContent = "0:00";
+        location.reload();
+        return;
+      }}
+
+      valueEl.textContent = formatCountdown(left);
+      if (left <= 60000) {{
+        banner.classList.add("urgent");
+      }}
+    }}
+
+    if (expiresAtMs && !isPaid && !isExpired) {{
+      tickCountdown();
+      setInterval(tickCountdown, 1000);
+    }}
 
     QRCode.toCanvas(document.createElement("canvas"), payAddress, {{ width: 220, margin: 1 }}, function(err, canvas) {{
       if (!err) document.getElementById("qrcode").appendChild(canvas);
@@ -365,13 +589,17 @@ def _render_payment_page(invoice_doc: dict) -> str:
 
     if (backUrl && isPaid) {{
       setTimeout(function() {{ window.location.href = backUrl; }}, 3000);
-    }} else if (!isPaid) {{
+    }} else if (!isPaid && !isExpired) {{
       setInterval(async function() {{
         try {{
           const resp = await fetch("/pay/" + orderId + "/status");
           if (!resp.ok) return;
           const data = await resp.json();
-          if (data.isPaid) location.reload();
+          if (data.isPaid || data.isExpired) {{
+            location.reload();
+            return;
+          }}
+          updatePartialPayment(data);
         }} catch (e) {{}}
       }}, 10000);
     }}
@@ -467,6 +695,7 @@ async def on_payment_confirmed(event: PaymentEvent):
 
 async def run_blockchain_monitor():
     """后台任务：监听区块链支付（每10秒检查一次，确保1分钟内检测到支付）"""
+    
     while True:
         try:
             await blockchain_monitor.check_payments()
@@ -543,7 +772,6 @@ async def lifespan(app: FastAPI):
     # 数据库
     mongo_client = AsyncIOMotorClient("mongodb://localhost:27017")
     db = mongo_client.payment_system
-
     # 初始化服务
     wallet_service = WalletService(config, db)
     blockchain_monitor = BlockchainMonitor(config, db, on_payment_confirmed)
@@ -825,8 +1053,9 @@ async def ph_pay_order_query(req: ThirdPartyQueryRequest):
 
     amount = float(invoice_doc.get("amount_due", 0.0) or 0.0)
 
-    # 实际支付金额：当前模型中仅支持全额支付，故等于 amount（未支付则为 0）
-    pay_amount = amount if is_paid else 0.0
+    # 实际支付金额：已全额支付时为 amount，部分支付时为 amount_paid，否则为 0
+    amount_paid = float(invoice_doc.get("amount_paid", 0.0) or 0.0)
+    pay_amount = amount if is_paid else amount_paid
 
     # 手续费：当前 SDK 不单独计费，这里返回 0
     cost_fee = 0.0
@@ -882,11 +1111,25 @@ async def payment_page_status(order_id: str):
     if not invoice_doc:
         raise HTTPException(status_code=404, detail="Order not found")
     status = invoice_doc.get("status", "pending")
+    expires_at_ms = _invoice_payment_deadline_ms(invoice_doc)
+    is_expired = status == "expired"
+    if not is_expired and expires_at_ms and expires_at_ms <= int(
+        datetime.now(timezone.utc).timestamp() * 1000
+    ):
+        is_expired = True
+
+    amount_due = float(invoice_doc.get("amount_due", 0.0) or 0.0)
+    amount_paid = float(invoice_doc.get("amount_paid", 0.0) or 0.0)
+
     return {
         "orderId": order_id,
         "status": status,
         "isPaid": status == "paid",
-        "amount": float(invoice_doc.get("amount_due", 0.0) or 0.0),
+        "isExpired": is_expired,
+        "expiresAtMs": expires_at_ms,
+        "amount": amount_due,
+        "amountPaid": amount_paid,
+        "amountRemaining": max(0.0, amount_due - amount_paid),
         "address": invoice_doc.get("address"),
         "txid": invoice_doc.get("txid"),
         "backUrl": invoice_doc.get("back_url"),

@@ -16,6 +16,7 @@ from .config import PaymentConfig
 from .wallet import WalletService
 from .blockchain import BlockchainMonitor
 from .sweep import SweepService
+from .energy_rent import EnergyRentService
 from .balance import BalanceSyncService
 from .models import Invoice, Address, PaymentCallback, PaymentEvent
 from .exceptions import (
@@ -30,6 +31,7 @@ __all__ = [
     "WalletService",
     "BlockchainMonitor",
     "SweepService",
+    "EnergyRentService",
     "BalanceSyncService",
     "Invoice",
     "Address",

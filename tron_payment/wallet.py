@@ -6,6 +6,7 @@ HD 钱包服务 - 地址派生
 """
 
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 from bip_utils import Bip44, Bip44Coins, Bip44Changes
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -121,7 +122,7 @@ class WalletService:
             # 2. 派生地址
             address_str = self.derive_address(index)
 
-            # 3. 创建订单
+            # 3. 创建订单（expires_at 仅在订单过期时写入）
             invoice = Invoice(
                 merchant_id=merchant_id,
                 amount_due=amount,
@@ -131,6 +132,7 @@ class WalletService:
                 notify_url=notify_url,
                 back_url=back_url,
                 pay_method=pay_method,
+                created_at=datetime.now(timezone.utc),
             )
 
             # 4. 创建地址记录

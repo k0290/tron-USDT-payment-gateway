@@ -44,6 +44,63 @@ class PaymentConfig(BaseSettings):
         description="归集最小金额（USDT），地址余额低于此值不归集",
     )
 
+    EXPIRE_TIME_WINDOW: int = Field(
+        default=3600,
+        gt=0,
+        description="订单支付有效期（秒），超时后 pending 订单标记为 expired",
+    )
+
+    # 能量获取方式：'delegate'（冻结/委托，默认）或 'rent'（从 tronenergy.market 租用）
+    ENERGY_MODE: str = Field(
+        default="delegate",
+        description="能量获取方式：'delegate' 冻结委托 / 'rent' 市场租用",
+    )
+
+    # tronenergy.market 租用能量配置（ENERGY_MODE='rent' 时使用）
+    TRONENERGY_API_SERVER: str = Field(
+        default="https://api.tronenergy.market",
+        description="tronenergy.market API 地址",
+    )
+    TRONENERGY_SERVER_ADDRESS: str = Field(
+        default="TEMkRxLtCCdL4BCwbPXbbNWe4a9gtJ7kq7",
+        description="tronenergy.market 收款地址（支付能量费用）",
+    )
+    TRONENERGY_API_KEY: Optional[str] = Field(
+        None,
+        description="tronenergy.market API Key（信用额度模式，免逐单签名；需与付款地址匹配）",
+    )
+    TRONENERGY_PAYER_ADDRESS: Optional[str] = Field(
+        None,
+        description="信用额度模式下的付款地址（必须与 API Key 匹配）",
+    )
+    RENT_ENERGY_AMOUNT: int = Field(
+        default=65_000,
+        gt=0,
+        description="每次租用的能量点数（单笔 USDT 转账约需 65000）",
+    )
+    RENT_DURATION_SECONDS: int = Field(
+        default=600,
+        gt=0,
+        description="租用时长（秒），10 分钟足够完成一次归集",
+    )
+    RENT_PRICE_SUN: int = Field(
+        default=50,
+        gt=0,
+        description="出价（sun/能量/天）。值越高越易成交，同时费用越高",
+    )
+    RENT_PARTFILL: bool = Field(
+        default=True, description="允许多个出借方共同成交订单"
+    )
+    RENT_WAIT_TIMEOUT: int = Field(
+        default=60,
+        gt=0,
+        description="下单后等待能量到账的最长秒数",
+    )
+    RENT_FALLBACK_TO_DELEGATE: bool = Field(
+        default=True,
+        description="租用失败时是否回退到冻结/委托方式（需配置 TRX_SOURCE_PRIVATE_KEY）",
+    )
+
     # USDT 精度
     USDT_DECIMALS: int = Field(default=1_000_000, description="USDT 精度（6位小数）")
 

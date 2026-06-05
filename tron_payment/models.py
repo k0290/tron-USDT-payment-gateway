@@ -21,6 +21,7 @@ class Invoice(BaseModel):
     merchant_order_id: Optional[str] = Field(None, description="商户订单ID")
     user_id: Optional[int] = Field(None, description="用户ID（如Telegram ID）")
     amount_due: float = Field(..., gt=0, description="应付金额 (USDT)")
+    amount_paid: float = Field(default=0.0, ge=0, description="已收到金额 (USDT)")
     status: str = Field(default="pending", description="订单状态: pending/paid/expired")
     notify_url: Optional[str] = Field(None, description="支付成功回调地址")
     back_url: Optional[str] = Field(None, description="支付完成后跳转地址")
@@ -28,6 +29,7 @@ class Invoice(BaseModel):
     address: Optional[str] = Field(None, description="收款地址")
     payer_address: Optional[str] = Field(None, description="付款人地址")
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    expires_at: Optional[datetime] = Field(None, description="订单过期时间")
     paid_at: Optional[datetime] = Field(None, description="支付时间")
     txid: Optional[str] = Field(None, description="交易哈希")
 

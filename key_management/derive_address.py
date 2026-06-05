@@ -9,25 +9,21 @@
 切勿在连接到互联网的服务器上暴露您的助记词。
 """
 
+import getpass
+
 from bip_utils import Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
 
-# ============================================
-# 选项 1：从助记词派生地址
-# ============================================
-# 替换为您自己的助记词（12 或 24 个词）
-YOUR_MNEMONIC = "chapter aisle join stem like figure dumb mail solve ketchup street open"
-
-# ============================================
-# 选项 2：从 XPUB 派生地址
-# ============================================
-# 如果您已有 XPUB，请改用此选项
-YOUR_XPUB = ""
+# 复用 derive_xpub.py 中的 xpub 派生函数
+try:
+    from derive_xpub import derive_tron_account_xpub
+except ImportError:
+    from key_management.derive_xpub import derive_tron_account_xpub
 
 
 def derive_address_from_mnemonic(mnemonic: str, address_index: int = 0) -> str:
     """从助记词派生 Tron 地址 (BIP44 路径: m/44'/195'/0'/0/address_index)"""
-    if not mnemonic or mnemonic == "your twelve or twenty four word mnemonic phrase goes here":
-        raise ValueError("请将 YOUR_MNEMONIC 替换为您实际的助记词短语")
+    if not mnemonic:
+        raise ValueError("助记词不能为空")
     
     # 从助记词生成种子
     seed = Bip39SeedGenerator(mnemonic).Generate()
@@ -59,46 +55,64 @@ def derive_address_from_xpub(xpub: str, address_index: int = 0) -> str:
     return address
 
 
+def _prompt_address_index() -> int:
+    """从终端读取地址索引（默认 0）。"""
+    raw = input("地址索引 (默认 0): ").strip()
+    if not raw:
+        return 0
+    try:
+        index = int(raw)
+        if index < 0:
+            raise ValueError
+        return index
+    except ValueError:
+        print("⚠️ 无效索引，使用默认值 0")
+        return 0
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Tron 地址派生工具")
     print("=" * 60)
     print()
-    
-    # 首先尝试从助记词派生
-    if YOUR_MNEMONIC and YOUR_MNEMONIC != "your twelve or twenty four word mnemonic phrase goes here":
-        try:
-            address = derive_address_from_mnemonic(YOUR_MNEMONIC, address_index=0)
-            print("✅ 从助记词派生:")
-            print(f"   地址 (索引 0): {address}")
-            print()
-            print("📝 将此地址用作您的 COLD_WALLET_ADDRESS")
-            print(f"   COLD_WALLET_ADDRESS={address}")
-            print()
-            print("🔗 测试网浏览器:")
-            print(f"   https://nile.tronscan.org/#/address/{address}")
-        except Exception as e:
-            print(f"❌ 从助记词派生时出错: {e}")
-    
-    # 尝试从 XPUB 派生
-    elif YOUR_XPUB:
-        try:
-            address = derive_address_from_xpub(YOUR_XPUB, address_index=0)
-            print("✅ 从 XPUB 派生:")
-            print(f"   地址 (索引 0): {address}")
-            print()
-            print("📝 将此地址用作您的 COLD_WALLET_ADDRESS")
-            print(f"   COLD_WALLET_ADDRESS={address}")
-            print()
-            print("🔗 测试网浏览器:")
-            print(f"   https://nile.tronscan.org/#/address/{address}")
-        except Exception as e:
-            print(f"❌ 从 XPUB 派生时出错: {e}")
-    
-    else:
-        print("❌ 请在此脚本中设置 YOUR_MNEMONIC 或 YOUR_XPUB")
+    print("请选择派生方式:")
+    print("  1) 助记词 (Mnemonic)")
+    print("  2) 扩展公钥 (XPUB)")
+    choice = input("输入 1 或 2 (默认 1): ").strip() or "1"
+    print()
+
+    try:
+        account_xpub = None
+        if choice == "2":
+            # 从终端读取 XPUB
+            xpub = input("请输入 XPUB: ").strip()
+            address_index = _prompt_address_index()
+            address = derive_address_from_xpub(xpub, address_index=address_index)
+            source_label = "XPUB"
+        else:
+            # 从终端读取助记词（不回显，避免泄露）
+            print("⚠️ 请在安全的离线环境中输入助记词；输入内容不会显示在屏幕上。")
+            mnemonic = getpass.getpass("请输入助记词 (12/24 个词): ").strip()
+            address_index = _prompt_address_index()
+            address = derive_address_from_mnemonic(mnemonic, address_index=address_index)
+            # 同时派生账户 xpub（m/44'/195'/0'），用于配置 ACCOUNT_XPUB
+            account_xpub = derive_tron_account_xpub(mnemonic, account_index=0)
+            source_label = "助记词"
+
         print()
-        print("选项 1: 使用您的助记词短语设置 YOUR_MNEMONIC")
-        print("选项 2: 使用您的扩展公钥设置 YOUR_XPUB")
+        print(f"✅ 从{source_label}派生:")
+        print(f"   地址 (索引 {address_index}): {address}")
         print()
-        print("然后运行: python key_management/derive_address.py")
+        print("📝 将此地址用作您的 COLD_WALLET_ADDRESS")
+        print(f"   COLD_WALLET_ADDRESS = {address}")
+
+        if account_xpub:
+            print()
+            print("🔑 账户 XPUB (m/44'/195'/0')：用于配置 ACCOUNT_XPUB")
+            print(f"   ACCOUNT_XPUB = {account_xpub}")
+
+        print()
+        print("🔗 测试网浏览器:")
+        print(f"   https://nile.tronscan.org/#/address/{address}")
+    except Exception as e:
+        print(f"❌ 派生地址时出错: {e}")

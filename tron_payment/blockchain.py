@@ -9,7 +9,7 @@ import logging
 import httpx
 import asyncio
 from typing import Optional, Callable, Any
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from .config import PaymentConfig
@@ -50,6 +50,68 @@ class BlockchainMonitor:
 
         logger.info("✅ BlockchainMonitor 初始化成功")
 
+    @staticmethod
+    def _parse_datetime(value) -> Optional[datetime]:
+        """解析 MongoDB 中的 datetime 或 ISO 字符串。"""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            dt = value
+        elif isinstance(value, str):
+            try:
+                if value.endswith("Z"):
+                    value = value[:-1] + "+00:00"
+                dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                return None
+        else:
+            return None
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    def _invoice_payment_deadline(self, invoice_doc: dict) -> Optional[datetime]:
+        """按 created_at + EXPIRE_TIME_WINDOW 计算支付截止时间。"""
+        created_at = self._parse_datetime(invoice_doc.get("created_at"))
+        if created_at is None:
+            return None
+        return created_at + timedelta(seconds=self.config.EXPIRE_TIME_WINDOW)
+
+    async def _expire_overdue_invoices(self) -> int:
+        """将超时的 pending 订单标记为 expired。"""
+        now = datetime.now(timezone.utc)
+        expired_count = 0
+
+        async for invoice_doc in self.db.invoices.find({"status": "pending"}):
+            invoice_id = invoice_doc.get("id") or invoice_doc.get("_id")
+            deadline = self._invoice_payment_deadline(invoice_doc)
+            if deadline is None or now < deadline:
+                continue
+
+            update_filter = {"status": "pending"}
+            if invoice_doc.get("_id"):
+                update_filter["_id"] = invoice_doc["_id"]
+            elif invoice_doc.get("id"):
+                update_filter["id"] = invoice_doc["id"]
+            else:
+                continue
+
+            result = await self.db.invoices.update_one(
+                update_filter,
+                {"$set": {"status": "expired", "expires_at": now}},
+            )
+            if result.modified_count:
+                expired_count += 1
+                logger.info(
+                    f"订单 {invoice_id} 已过期 (expires_at={now.isoformat()})"
+                )
+
+        if expired_count:
+            logger.info(f"已将 {expired_count} 个订单标记为 expired")
+
+        return expired_count
+
     async def check_payments(self):
         """
         检查所有待支付订单的链上交易
@@ -57,6 +119,9 @@ class BlockchainMonitor:
         这个方法应该被周期性调用（推荐30秒一次）
         """
         logger.debug("开始检查待支付订单...")
+
+        # 先将超时 pending 订单标记为 expired，后续仅监听仍有效的 pending 订单
+        await self._expire_overdue_invoices()
 
         pending_count = 0
         async for _ in self.db.invoices.find({"status": "pending"}):
@@ -89,30 +154,19 @@ class BlockchainMonitor:
             )
             return
 
-        amount_due_raw = int(amount_due * self.config.USDT_DECIMALS)
-
-        # 处理 created_at - MongoDB 可能返回 datetime 对象或字符串
-        created_at = invoice_doc.get("created_at")
-        if isinstance(created_at, str):
-            # 尝试解析 ISO 格式字符串
-            try:
-                if created_at.endswith("Z"):
-                    created_at = created_at[:-1] + "+00:00"
-                created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-            except (ValueError, AttributeError):
-                logger.warning(
-                    f"订单 {invoice_id} 的 created_at 格式无法解析: {created_at}"
-                )
-                return
-        elif not isinstance(created_at, datetime):
-            logger.warning(
-                f"订单 {invoice_id} 的 created_at 类型不正确: {type(created_at)}, 值: {created_at}"
-            )
+        deadline = self._invoice_payment_deadline(invoice_doc)
+        if deadline and datetime.now(timezone.utc) >= deadline:
+            logger.debug(f"订单 {invoice_id} 已过期，跳过链上检查")
             return
 
-        # 确保时区信息存在
-        if created_at.tzinfo is None:
-            created_at = created_at.replace(tzinfo=timezone.utc)
+        amount_due_raw = int(amount_due * self.config.USDT_DECIMALS)
+
+        created_at = self._parse_datetime(invoice_doc.get("created_at"))
+        if created_at is None:
+            logger.warning(
+                f"订单 {invoice_id} 的 created_at 无法解析: {invoice_doc.get('created_at')}"
+            )
+            return
 
         min_timestamp = int(created_at.timestamp() * 1000)
 
@@ -155,50 +209,85 @@ class BlockchainMonitor:
                 f"订单 {invoice_id} 找到 {len(transactions)} 笔交易，开始匹配..."
             )
 
-            # 查找匹配的交易
-            for tx in transactions:
-                try:
-                    tx_amount = int(tx.get("value", 0))
-                    tx_id = tx.get("transaction_id")
-                    tx_timestamp = tx.get("block_timestamp", 0)
+            total_paid_raw, confirm_tx = await self._sum_incoming_for_invoice(
+                invoice_id, amount_due_raw, transactions
+            )
+            if total_paid_raw <= 0:
+                return
 
-                    # 检查交易是否已被其他订单使用
-                    if tx_id:
-                        existing_invoice = await self.db.invoices.find_one(
-                            {"txid": tx_id}
-                        )
-                        if existing_invoice:
-                            existing_id = existing_invoice.get(
-                                "id"
-                            ) or existing_invoice.get("_id")
-                            if str(existing_id) != str(invoice_id):
-                                logger.debug(
-                                    f"交易 {tx_id} 已被订单 {existing_id} 使用，跳过"
-                                )
-                                continue
+            amount_paid = total_paid_raw / self.config.USDT_DECIMALS
+            stored_paid_raw = int(
+                round(float(invoice_doc.get("amount_paid") or 0) * self.config.USDT_DECIMALS)
+            )
 
-                    # 检查金额是否匹配
-                    if tx_amount == amount_due_raw:
-                        logger.info(
-                            f"✅ 找到匹配支付: 订单={invoice_id}, "
-                            f"金额={amount_due} USDT, TX={tx_id}, "
-                            f"时间戳={tx_timestamp}"
-                        )
-                        await self._confirm_payment(invoice_doc, tx)
-                        return  # 找到匹配后立即返回
-                    else:
-                        logger.debug(
-                            f"交易 {tx_id} 金额不匹配: "
-                            f"期望={amount_due_raw}, 实际={tx_amount}"
-                        )
-                except Exception as e:
-                    logger.warning(f"处理交易时出错: {e}, 交易数据: {tx}")
-                    continue
+            if total_paid_raw >= amount_due_raw:
+                logger.info(
+                    f"✅ 找到足额支付: 订单={invoice_id}, "
+                    f"已收={amount_paid} USDT, 应付={amount_due} USDT"
+                )
+                await self._confirm_payment(invoice_doc, confirm_tx)
+                return
+
+            if total_paid_raw != stored_paid_raw:
+                update_filter = {"status": "pending"}
+                if invoice_doc.get("_id"):
+                    update_filter["_id"] = invoice_doc["_id"]
+                elif invoice_doc.get("id"):
+                    update_filter["id"] = invoice_doc["id"]
+                else:
+                    return
+
+                await self.db.invoices.update_one(
+                    update_filter, {"$set": {"amount_paid": amount_paid}}
+                )
+                logger.info(
+                    f"订单 {invoice_id} 部分支付: {amount_paid:.6f} / {amount_due} USDT"
+                )
 
         except httpx.HTTPError as e:
             logger.error(f"查询订单 {invoice_id} 的交易时网络错误: {e}")
         except Exception as e:
             logger.error(f"检查订单 {invoice_id} 时发生未知错误: {e}", exc_info=True)
+
+    async def _sum_incoming_for_invoice(
+        self, invoice_id, amount_due_raw: int, transactions: list
+    ) -> tuple[int, Optional[dict]]:
+        """汇总收款地址在订单创建后的入账金额（支持多笔部分支付）。"""
+        total_raw = 0
+        last_tx = None
+        confirming_tx = None
+
+        for tx in transactions:
+            try:
+                tx_amount = int(tx.get("value", 0))
+                if tx_amount <= 0:
+                    continue
+
+                tx_id = tx.get("transaction_id")
+                if tx_id:
+                    existing_invoice = await self.db.invoices.find_one(
+                        {"txid": tx_id}
+                    )
+                    if existing_invoice:
+                        existing_id = existing_invoice.get(
+                            "id"
+                        ) or existing_invoice.get("_id")
+                        if str(existing_id) != str(invoice_id):
+                            logger.debug(
+                                f"交易 {tx_id} 已被订单 {existing_id} 使用，跳过"
+                            )
+                            continue
+
+                total_raw += tx_amount
+                last_tx = tx
+                if total_raw >= amount_due_raw:
+                    confirming_tx = tx
+                    break
+            except Exception as e:
+                logger.warning(f"处理交易时出错: {e}, 交易数据: {tx}")
+                continue
+
+        return total_raw, confirming_tx or last_tx
 
     async def _confirm_payment(self, invoice_doc: dict, tx: dict):
         """确认支付并更新订单"""
@@ -227,6 +316,7 @@ class BlockchainMonitor:
             {
                 "$set": {
                     "status": "paid",
+                    "amount_paid": invoice_doc.get("amount_due"),
                     "paid_at": datetime.now(timezone.utc),
                     "txid": tx_id,
                     "payer_address": tx.get("from"),
