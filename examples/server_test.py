@@ -203,16 +203,20 @@ def test_create_order(client: httpx.Client, notify_url: str, back_url: str):
             return None, None, None
         
         system_order_id = create_json["data"]["systemOrderId"]
-        pay_url = create_json["data"]["payUrl"]
-        pay_address = create_json["data"].get("address", pay_url)
+        pay_address = create_json["data"]["address"]
+        qr_code = create_json["data"].get("qrCode", "")
+        order_amount = create_json["data"].get("amount")
+        expire_time = create_json["data"].get("expireTime")
 
         print(f"\n✅ 订单创建成功")
         print(f"  - 系统订单号: {system_order_id}")
-        print(f"  - 支付页面: {pay_url}")
         print(f"  - 收款地址: {pay_address}")
+        print(f"  - 订单金额: {order_amount} USDT")
+        print(f"  - 过期时间: {expire_time}")
+        print(f"  - 二维码: {len(qr_code)} chars ({'data URI' if qr_code.startswith('data:image/png;base64,') else 'raw'})")
         print(f"  - 区块浏览器: https://nile.tronscan.org/#/address/{pay_address}")
 
-        return mch_order_id, system_order_id, pay_url
+        return mch_order_id, system_order_id, pay_address
         
     except Exception as e:
         print(f"❌ 创建订单请求失败: {e}")
@@ -256,13 +260,17 @@ def test_query_order(client: httpx.Client, mch_order_id: str):
         data = query_json["data"]
         is_paid = data.get("isPaid", 0)
         back_url = data.get("backUrl")
+        query_qr_code = data.get("qrCode", "")
         
         print(f"\n✅ 订单查询成功")
         print(f"  - 支付状态: {'已支付' if is_paid == 1 else '未支付'}")
         print(f"  - 订单金额: {data.get('amount')} USDT")
-        print(f"  - 实际支付: {data.get('payAmount')} USDT")
+        print(f"  - 已支付: {data.get('amountPaid')} USDT")
+        print(f"  - 待支付: {data.get('amountRemaining')} USDT")
         print(f"  - 创建时间: {data.get('createdAt')}")
         print(f"  - 支付时间: {data.get('paidAt') or '未支付'}")
+        print(f"  - 收款地址: {data.get('address') or '未设置'}")
+        print(f"  - 二维码: {len(query_qr_code)} chars ({'data URI' if query_qr_code.startswith('data:image/png;base64,') else 'raw'})")
         print(f"  - backUrl: {back_url or '未设置'}")
         
         return query_json
@@ -343,7 +351,7 @@ def main():
                 return
             
             # 测试 2: 创建订单
-            mch_order_id, system_order_id, pay_url = test_create_order(
+            mch_order_id, system_order_id, pay_address = test_create_order(
                 client, notify_url, back_url
             )
             if not mch_order_id:
@@ -361,7 +369,7 @@ def main():
                 print("下一步：")
                 print("=" * 60)
                 print(f"1. 向以下地址转账 10.00 USDT (TRC20):")
-                print(f"   {pay_url}")
+                print(f"   {pay_address}")
                 print(f"\n2. 支付后，系统将在 10-60 秒内检测到支付")
                 print(f"3. 检测到支付后，系统会发送 notifyUrl 回调")
                 print(f"4. 回调服务器会自动验证签名并显示结果")

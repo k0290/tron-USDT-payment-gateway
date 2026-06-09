@@ -11,7 +11,7 @@
 - **资金归集** — 将收款地址 USDT 归集到冷钱包（需签名服务）
 - **余额同步** — 定期从链上同步地址余额
 - **事件回调** — 支付确认后可触发自定义逻辑
-- **HTTP 示例** — `server.py` 提供下单 API 与支付页
+- **HTTP 示例** — `server.py` 提供下单与查询 API
 
 ---
 
@@ -225,7 +225,7 @@ TRX_SOURCE_PRIVATE_KEY=your_hex_private_key
 # 终端演示：创建订单、监听支付、可选归集
 python examples/basic_usage.py
 
-# HTTP 服务：API + 支付页 /pay/{order_id} + 后台监听
+# HTTP 服务：支付 API + 后台监听
 python server.py
 ```
 
@@ -237,10 +237,8 @@ python server.py
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/PH/pay/create` | 创建订单，返回 `payUrl`（支付页）、`address` |
+| POST | `/api/PH/pay/create` | 创建订单，返回 `qrCode`（`data:image/png;base64,...`）、`address` |
 | POST | `/api/PH/pay/order/Query` | 查询订单状态 |
-| GET | `/pay/{order_id}` | 支付页（二维码、金额、地址） |
-| GET | `/pay/{order_id}/status` | 支付状态 JSON（页面轮询） |
 | GET | `/health` | 健康检查 |
 
 集成测试客户端：`examples/server_test.py`（需先启动 `server.py`）。
@@ -263,7 +261,7 @@ python server.py
 proj_usdt-main/
 ├── .env.example            # 配置模板（可提交）
 ├── .env                    # 本地配置（勿提交）
-├── server.py               # FastAPI 支付 API + 支付页
+├── server.py               # FastAPI 支付 API
 ├── signing_server/         # 独立签名服务
 │   ├── .env.example
 │   └── main.py

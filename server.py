@@ -11,18 +11,19 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import asyncio
-import html
+import base64
+import io
 import json
 import logging
 import hashlib
 import httpx
+import qrcode
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI
 from pydantic import BaseModel
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -79,14 +80,6 @@ def _calc_sign(params: dict, merchant_key: str) -> str:
     return md5.upper()
 
 
-def _format_datetime(value) -> str:
-    if value is None:
-        return ""
-    if hasattr(value, "isoformat"):
-        return value.isoformat()
-    return str(value)
-
-
 def _parse_datetime(value) -> Optional[datetime]:
     if value is None:
         return None
@@ -116,496 +109,25 @@ def _invoice_payment_deadline_ms(invoice_doc: dict) -> Optional[int]:
     return int(deadline.timestamp() * 1000)
 
 
-def _network_label(trongrid_url: str) -> str:
-    url = (trongrid_url or "").lower()
-    if "nile" in url:
-        return "Tron Nile (Testnet)"
-    if "shasta" in url:
-        return "Tron Shasta (Testnet)"
-    return "Tron Mainnet"
+def _invoice_expire_time_str(invoice_doc: dict) -> str:
+    """支付截止时间 ISO 字符串。"""
+    deadline_ms = _invoice_payment_deadline_ms(invoice_doc)
+    if deadline_ms is None:
+        return ""
+    return datetime.fromtimestamp(
+        deadline_ms / 1000, tz=timezone.utc
+    ).isoformat()
 
 
-def _explorer_address_url(trongrid_url: str, address: str) -> str:
-    url = (trongrid_url or "").lower()
-    if "nile" in url:
-        return f"https://nile.tronscan.org/#/address/{address}"
-    if "shasta" in url:
-        return f"https://shasta.tronscan.org/#/address/{address}"
-    return f"https://tronscan.org/#/address/{address}"
-
-
-def _render_payment_page(invoice_doc: dict) -> str:
-    status = invoice_doc.get("status", "pending")
-    is_paid = status == "paid"
-    is_expired = status == "expired"
-    address = invoice_doc.get("address") or ""
-    amount = float(invoice_doc.get("amount_due", 0.0) or 0.0)
-    amount_paid = float(invoice_doc.get("amount_paid", 0.0) or 0.0)
-    amount_remaining = max(0.0, amount - amount_paid)
-    is_partial = not is_paid and not is_expired and amount_paid > 0
-    progress_pct = min(100.0, (amount_paid / amount) * 100.0) if amount > 0 else 0.0
-    order_id = invoice_doc.get("id") or ""
-    merchant_id = invoice_doc.get("merchant_id") or "—"
-    merchant_order_id = invoice_doc.get("merchant_order_id") or "—"
-    pay_method = invoice_doc.get("pay_method") or "USDT-TRC20"
-    created_at = _format_datetime(invoice_doc.get("created_at"))
-    expires_at = _format_datetime(invoice_doc.get("expires_at"))
-    paid_at = _format_datetime(invoice_doc.get("paid_at"))
-    back_url = invoice_doc.get("back_url") or ""
-    txid = invoice_doc.get("txid") or ""
-
-    trongrid_url = payment_config.TRONGRID_API_URL if payment_config else ""
-    network = _network_label(trongrid_url)
-    explorer_url = _explorer_address_url(trongrid_url, address) if address else "#"
-    usdt_contract = payment_config.USDT_CONTRACT_ADDRESS if payment_config else ""
-
-    if is_paid:
-        status_label = "Paid"
-        status_class = "status-paid"
-    elif is_expired:
-        status_label = "Expired"
-        status_class = "status-expired"
-    else:
-        status_label = "Awaiting payment"
-        status_class = "status-pending"
-    amount_display = f"{amount:.2f}"
-    expires_at_ms = _invoice_payment_deadline_ms(invoice_doc)
-
-    paid_block = ""
-    if is_paid:
-        paid_block = f"""
-        <div class="paid-banner">
-          <strong>Payment received.</strong>
-          {"You will be redirected shortly." if back_url else "Thank you."}
-        </div>
-        """
-
-    expired_block = ""
-    if is_expired:
-        expired_block = f"""
-        <div class="expired-banner">
-          <strong>This payment link has expired.</strong>
-          {"Expired at: " + html.escape(expires_at) if expires_at else "Please create a new order."}
-        </div>
-        """
-
-    countdown_block = ""
-    if not is_paid and not is_expired and expires_at_ms:
-        countdown_block = """
-        <div class="countdown-banner" id="countdown-banner">
-          <span class="countdown-label">Time remaining</span>
-          <span class="countdown-value" id="countdown-value">--:--</span>
-        </div>
-        """
-
-    partial_block = f"""
-        <div class="partial-banner" id="partial-payment-block" style="display: {"block" if is_partial else "none"};">
-          <div class="partial-title">Partial payment received</div>
-          <div class="partial-amounts">
-            <span><strong id="partial-paid">{amount_paid:.2f}</strong> / <span id="partial-due">{amount:.2f}</span> USDT paid</span>
-            <span class="partial-remaining" id="partial-remaining">{amount_remaining:.2f} USDT remaining</span>
-          </div>
-          <div class="progress-bar">
-            <div class="progress-fill" id="partial-progress" style="width: {progress_pct:.1f}%;"></div>
-          </div>
-        </div>
-        """
-
-    if is_partial:
-        hint_text = (
-            f"Send the remaining <strong>{amount_remaining:.2f} USDT</strong> "
-            f"to complete this payment. Already received <strong>{amount_paid:.2f} USDT</strong>."
-        )
-    else:
-        hint_text = (
-            f"Send <strong>exactly {amount_display} USDT</strong> on TRC20 to the address above. "
-            "Wrong amounts may not be matched automatically. Include enough TRX for network fees."
-        )
-
-    tx_block = ""
-    if txid:
-        tx_block = f"""
-        <div class="meta-row">
-          <span class="meta-label">Transaction</span>
-          <span class="meta-value mono">{html.escape(txid)}</span>
-        </div>
-        """
-
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Pay {html.escape(amount_display)} USDT</title>
-  <script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
-  <style>
-    :root {{
-      --bg: #0f1419;
-      --card: #1a2332;
-      --border: #2d3a4f;
-      --text: #e7ecf3;
-      --muted: #8b9cb3;
-      --accent: #c026d3;
-      --accent-dim: #86198f;
-      --success: #22c55e;
-      --pending: #f59e0b;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      min-height: 100vh;
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      background: radial-gradient(ellipse at top, #1e293b 0%, var(--bg) 55%);
-      color: var(--text);
-      padding: 24px 16px;
-    }}
-    .wrap {{ max-width: 480px; margin: 0 auto; }}
-    .card {{
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 24px;
-      box-shadow: 0 20px 50px rgba(0,0,0,.35);
-    }}
-    h1 {{ margin: 0 0 4px; font-size: 1.35rem; font-weight: 600; }}
-    .subtitle {{ color: var(--muted); font-size: .9rem; margin-bottom: 20px; }}
-    .amount {{
-      font-size: 2.25rem;
-      font-weight: 700;
-      letter-spacing: -0.02em;
-      margin: 16px 0 4px;
-    }}
-    .amount span {{ font-size: 1rem; color: var(--muted); font-weight: 500; }}
-    .status {{
-      display: inline-block;
-      padding: 4px 10px;
-      border-radius: 999px;
-      font-size: .75rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: .04em;
-    }}
-    .status-pending {{ background: rgba(245,158,11,.15); color: var(--pending); }}
-    .status-paid {{ background: rgba(34,197,94,.15); color: var(--success); }}
-    .status-expired {{ background: rgba(239,68,68,.15); color: #ef4444; }}
-    .countdown-banner {{
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 16px;
-      padding: 12px 14px;
-      background: rgba(245,158,11,.1);
-      border: 1px solid rgba(245,158,11,.35);
-      border-radius: 10px;
-    }}
-    .countdown-label {{
-      font-size: .85rem;
-      color: var(--muted);
-    }}
-    .countdown-value {{
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 1.25rem;
-      font-weight: 700;
-      color: var(--pending);
-      letter-spacing: .04em;
-    }}
-    .countdown-banner.urgent {{
-      background: rgba(239,68,68,.1);
-      border-color: rgba(239,68,68,.35);
-    }}
-    .countdown-banner.urgent .countdown-value {{ color: #ef4444; }}
-    .expired-banner {{
-      margin-bottom: 16px;
-      padding: 12px;
-      background: rgba(239,68,68,.12);
-      border: 1px solid rgba(239,68,68,.35);
-      border-radius: 10px;
-      color: #ef4444;
-      font-size: .9rem;
-    }}
-    .partial-banner {{
-      margin-bottom: 16px;
-      padding: 14px;
-      background: rgba(59,130,246,.1);
-      border: 1px solid rgba(59,130,246,.35);
-      border-radius: 10px;
-    }}
-    .partial-title {{
-      font-size: .85rem;
-      font-weight: 600;
-      color: #60a5fa;
-      margin-bottom: 8px;
-    }}
-    .partial-amounts {{
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      flex-wrap: wrap;
-      font-size: .9rem;
-      margin-bottom: 10px;
-    }}
-    .partial-remaining {{
-      color: var(--pending);
-      font-weight: 600;
-    }}
-    .progress-bar {{
-      height: 8px;
-      background: rgba(45,58,79,.8);
-      border-radius: 999px;
-      overflow: hidden;
-    }}
-    .progress-fill {{
-      height: 100%;
-      background: linear-gradient(90deg, #3b82f6, #60a5fa);
-      border-radius: 999px;
-      transition: width .4s ease;
-    }}
-    .qr-wrap {{
-      display: flex;
-      justify-content: center;
-      margin: 24px 0;
-      padding: 16px;
-      background: #fff;
-      border-radius: 12px;
-    }}
-    #qrcode canvas, #qrcode img {{ display: block; }}
-    .address-box {{
-      background: #0d1117;
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 12px 14px;
-      margin: 12px 0;
-    }}
-    .address-label {{ font-size: .75rem; color: var(--muted); margin-bottom: 6px; }}
-    .address-value {{
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: .82rem;
-      word-break: break-all;
-      line-height: 1.45;
-    }}
-    .actions {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }}
-    button, a.btn {{
-      flex: 1;
-      min-width: 120px;
-      padding: 10px 14px;
-      border-radius: 8px;
-      font-size: .875rem;
-      font-weight: 600;
-      cursor: pointer;
-      text-align: center;
-      text-decoration: none;
-      border: none;
-    }}
-    .btn-primary {{
-      background: linear-gradient(135deg, var(--accent), var(--accent-dim));
-      color: #fff;
-    }}
-    .btn-secondary {{
-      background: transparent;
-      color: var(--text);
-      border: 1px solid var(--border);
-    }}
-    .meta {{ margin-top: 24px; border-top: 1px solid var(--border); padding-top: 16px; }}
-    .meta-row {{
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 8px 0;
-      font-size: .85rem;
-      border-bottom: 1px solid rgba(45,58,79,.5);
-    }}
-    .meta-row:last-child {{ border-bottom: none; }}
-    .meta-label {{ color: var(--muted); flex-shrink: 0; }}
-    .meta-value {{ text-align: right; word-break: break-all; }}
-    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; }}
-    .hint {{
-      margin-top: 20px;
-      padding: 12px;
-      background: rgba(192,38,211,.08);
-      border: 1px solid rgba(192,38,211,.25);
-      border-radius: 10px;
-      font-size: .82rem;
-      color: var(--muted);
-      line-height: 1.5;
-    }}
-    .paid-banner {{
-      margin-bottom: 16px;
-      padding: 12px;
-      background: rgba(34,197,94,.12);
-      border: 1px solid rgba(34,197,94,.35);
-      border-radius: 10px;
-      color: var(--success);
-      font-size: .9rem;
-    }}
-    .toast {{
-      position: fixed;
-      bottom: 24px;
-      left: 50%;
-      transform: translateX(-50%);
-      background: #334155;
-      color: #fff;
-      padding: 10px 18px;
-      border-radius: 8px;
-      font-size: .875rem;
-      opacity: 0;
-      transition: opacity .25s;
-      pointer-events: none;
-    }}
-    .toast.show {{ opacity: 1; }}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="card">
-      {paid_block}
-      {expired_block}
-      {countdown_block}
-      {partial_block}
-      <span class="status {status_class}">{status_label}</span>
-      <h1>USDT Payment</h1>
-      <p class="subtitle">{html.escape(network)} · {html.escape(pay_method)}</p>
-      <div class="amount">{html.escape(amount_display)} <span>USDT</span></div>
-
-      <div class="qr-wrap"><div id="qrcode"></div></div>
-
-      <div class="address-box">
-        <div class="address-label">Deposit address (TRC20)</div>
-        <div class="address-value" id="pay-address">{html.escape(address)}</div>
-      </div>
-
-      <div class="actions">
-        <button type="button" class="btn-primary" id="copy-btn">Copy address</button>
-        <a class="btn btn-secondary" href="{html.escape(explorer_url)}" target="_blank" rel="noopener">View on Tronscan</a>
-      </div>
-
-      <div class="hint" id="payment-hint">
-        {hint_text}
-      </div>
-
-      <div class="meta">
-        <div class="meta-row">
-          <span class="meta-label">Order ID</span>
-          <span class="meta-value mono">{html.escape(order_id)}</span>
-        </div>
-        <div class="meta-row">
-          <span class="meta-label">Merchant order</span>
-          <span class="meta-value">{html.escape(merchant_order_id)}</span>
-        </div>
-        <div class="meta-row">
-          <span class="meta-label">Merchant ID</span>
-          <span class="meta-value">{html.escape(merchant_id)}</span>
-        </div>
-        <div class="meta-row">
-          <span class="meta-label">Created</span>
-          <span class="meta-value">{html.escape(created_at)}</span>
-        </div>
-        {"<div class=\"meta-row\"><span class=\"meta-label\">Paid at</span><span class=\"meta-value\">" + html.escape(paid_at) + "</span></div>" if paid_at else ""}
-        {"<div class=\"meta-row\"><span class=\"meta-label\">Expired at</span><span class=\"meta-value\">" + html.escape(expires_at) + "</span></div>" if expires_at else ""}
-        {tx_block}
-        {"<div class=\"meta-row\"><span class=\"meta-label\">Token contract</span><span class=\"meta-value mono\">" + html.escape(usdt_contract) + "</span></div>" if usdt_contract else ""}
-      </div>
-    </div>
-  </div>
-  <div class="toast" id="toast">Address copied</div>
-  <script>
-    const payAddress = {json.dumps(address)};
-    const orderId = {json.dumps(order_id)};
-    const backUrl = {json.dumps(back_url)};
-    const isPaid = {"true" if is_paid else "false"};
-    const isExpired = {"true" if is_expired else "false"};
-    const expiresAtMs = {expires_at_ms if expires_at_ms else "null"};
-    const amountDue = {amount};
-
-    function updatePartialPayment(data) {{
-      const paid = Number(data.amountPaid || 0);
-      const due = Number(data.amount || amountDue);
-      const remaining = Math.max(0, due - paid);
-      const block = document.getElementById("partial-payment-block");
-      const hint = document.getElementById("payment-hint");
-
-      if (!block) return;
-
-      if (paid > 0 && paid < due) {{
-        block.style.display = "block";
-        document.getElementById("partial-paid").textContent = paid.toFixed(2);
-        document.getElementById("partial-due").textContent = due.toFixed(2);
-        document.getElementById("partial-remaining").textContent = remaining.toFixed(2) + " USDT remaining";
-        document.getElementById("partial-progress").style.width = Math.min(100, (paid / due) * 100).toFixed(1) + "%";
-        if (hint) {{
-          hint.innerHTML = "Send the remaining <strong>" + remaining.toFixed(2) + " USDT</strong> to complete this payment. Already received <strong>" + paid.toFixed(2) + " USDT</strong>.";
-        }}
-      }} else {{
-        block.style.display = "none";
-      }}
-    }}
-
-    function formatCountdown(ms) {{
-      const total = Math.max(0, Math.floor(ms / 1000));
-      const h = Math.floor(total / 3600);
-      const m = Math.floor((total % 3600) / 60);
-      const s = total % 60;
-      if (h > 0) {{
-        return h + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
-      }}
-      return m + ":" + String(s).padStart(2, "0");
-    }}
-
-    function tickCountdown() {{
-      if (!expiresAtMs || isPaid || isExpired) return;
-      const banner = document.getElementById("countdown-banner");
-      const valueEl = document.getElementById("countdown-value");
-      if (!banner || !valueEl) return;
-
-      const left = expiresAtMs - Date.now();
-      if (left <= 0) {{
-        valueEl.textContent = "0:00";
-        location.reload();
-        return;
-      }}
-
-      valueEl.textContent = formatCountdown(left);
-      if (left <= 60000) {{
-        banner.classList.add("urgent");
-      }}
-    }}
-
-    if (expiresAtMs && !isPaid && !isExpired) {{
-      tickCountdown();
-      setInterval(tickCountdown, 1000);
-    }}
-
-    QRCode.toCanvas(document.createElement("canvas"), payAddress, {{ width: 220, margin: 1 }}, function(err, canvas) {{
-      if (!err) document.getElementById("qrcode").appendChild(canvas);
-    }});
-
-    document.getElementById("copy-btn").addEventListener("click", function() {{
-      navigator.clipboard.writeText(payAddress).then(function() {{
-        const t = document.getElementById("toast");
-        t.classList.add("show");
-        setTimeout(function() {{ t.classList.remove("show"); }}, 2000);
-      }});
-    }});
-
-    if (backUrl && isPaid) {{
-      setTimeout(function() {{ window.location.href = backUrl; }}, 3000);
-    }} else if (!isPaid && !isExpired) {{
-      setInterval(async function() {{
-        try {{
-          const resp = await fetch("/pay/" + orderId + "/status");
-          if (!resp.ok) return;
-          const data = await resp.json();
-          if (data.isPaid || data.isExpired) {{
-            location.reload();
-            return;
-          }}
-          updatePartialPayment(data);
-        }} catch (e) {{}}
-      }}, 10000);
-    }}
-  </script>
-</body>
-</html>"""
+def _address_qr_code_base64(address: str) -> str:
+    """收款地址二维码 PNG，返回 data:image/png;base64,... 字符串。"""
+    if not address:
+        return ""
+    img = qrcode.make(address, box_size=8, border=1)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
 
 
 async def on_payment_confirmed(event: PaymentEvent):
@@ -847,18 +369,22 @@ class ThirdPartyCreateRequest(BaseModel):
 
 
 class ThirdPartyData(BaseModel):
-    payUrl: str
+    qrCode: str
     systemOrderId: str
     address: str
+    amount: float
+    expireTime: str
 
 
 class ThirdPartyCreateResponse(BaseModel):
     """
     第三方文档风格的响应：
     - code: 200 表示成功
-    - data.payUrl: 支付页面链接（含订单信息与二维码）
+    - data.qrCode: 收款地址二维码 (data:image/png;base64,...)
     - data.systemOrderId: 系统订单号
     - data.address: Tron 收款地址
+    - data.amount: 订单金额 (USDT)
+    - data.expireTime: 支付截止时间 (ISO 8601)
     - message: 失败时的原因
     """
 
@@ -868,14 +394,14 @@ class ThirdPartyCreateResponse(BaseModel):
 
 
 @app.post("/api/PH/pay/create", response_model=ThirdPartyCreateResponse)
-async def ph_pay_create(req: ThirdPartyCreateRequest, request: Request):
+async def ph_pay_create(req: ThirdPartyCreateRequest):
     """
     按第三方文档要求的下单接口：
     - 路径：/api/PH/pay/create
     - 方法：POST
     - 入参和签名算法与文档一致
 
-    本接口内部会创建一笔区块链收款订单（USDT-TRC20），并返回支付页面链接作为 payUrl。
+    本接口内部会创建一笔区块链收款订单（USDT-TRC20），并返回收款地址二维码 (base64 PNG)。
     """
     # 1. 基础校验：商户配置
     if not MERCHANT_KEY:
@@ -937,14 +463,14 @@ async def ph_pay_create(req: ThirdPartyCreateRequest, request: Request):
             message="Create order failed",
         )
 
-    # 5. 构造支付页面链接
-    base_url = str(request.base_url).rstrip("/")
-    pay_url = f"{base_url}/pay/{invoice.id}"
+    invoice_doc = invoice.model_dump()
 
     data = ThirdPartyData(
-        payUrl=pay_url,
+        qrCode=_address_qr_code_base64(address.address),
         systemOrderId=invoice.id,
         address=address.address,
+        amount=amount_float,
+        expireTime=_invoice_expire_time_str(invoice_doc),
     )
 
     return ThirdPartyCreateResponse(
@@ -976,10 +502,13 @@ class ThirdPartyQueryData(BaseModel):
     isPaid: int          # 0 = 未支付, 1 = 已支付
     isGotReceipt: int    # 0/1 收款状态（这里与 isPaid 保持一致或按需扩展）
     amount: float        # 订单金额
-    payAmount: float     # 实际支付金额（目前等于 amount）
+    amountPaid: float    # 已支付金额（含部分支付）
+    amountRemaining: float  # 待支付金额
     costFee: float       # 手续费（目前填 0）
     createdAt: str       # 创建时间
     paidAt: str          # 支付时间（未支付时返回空字符串）
+    address: str         # Tron 收款地址
+    qrCode: str          # 收款地址二维码 (data:image/png;base64,...)
     backUrl: Optional[str] = None  # 支付完成后跳转地址（仅在已支付时返回）
 
 
@@ -1053,9 +582,8 @@ async def ph_pay_order_query(req: ThirdPartyQueryRequest):
 
     amount = float(invoice_doc.get("amount_due", 0.0) or 0.0)
 
-    # 实际支付金额：已全额支付时为 amount，部分支付时为 amount_paid，否则为 0
     amount_paid = float(invoice_doc.get("amount_paid", 0.0) or 0.0)
-    pay_amount = amount if is_paid else amount_paid
+    amount_remaining = max(0.0, amount - amount_paid)
 
     # 手续费：当前 SDK 不单独计费，这里返回 0
     cost_fee = 0.0
@@ -1077,14 +605,19 @@ async def ph_pay_order_query(req: ThirdPartyQueryRequest):
     if is_paid:
         back_url = invoice_doc.get("back_url")
 
+    pay_address = invoice_doc.get("address") or ""
+
     data = ThirdPartyQueryData(
         isPaid=is_paid,
         isGotReceipt=is_got_receipt,
         amount=amount,
-        payAmount=pay_amount,
+        amountPaid=amount_paid,
+        amountRemaining=amount_remaining,
         costFee=cost_fee,
         createdAt=created_at_str,
         paidAt=paid_at_str,
+        address=pay_address,
+        qrCode=_address_qr_code_base64(pay_address),
         backUrl=back_url,
     )
 
@@ -1093,47 +626,6 @@ async def ph_pay_order_query(req: ThirdPartyQueryRequest):
         data=data,
         message="success",
     )
-
-
-@app.get("/pay/{order_id}", response_class=HTMLResponse)
-async def payment_page(order_id: str):
-    """Hosted payment page with order metadata, QR code, and deposit address."""
-    invoice_doc = await db.invoices.find_one({"id": order_id})
-    if not invoice_doc:
-        raise HTTPException(status_code=404, detail="Order not found")
-    return HTMLResponse(content=_render_payment_page(invoice_doc))
-
-
-@app.get("/pay/{order_id}/status")
-async def payment_page_status(order_id: str):
-    """JSON status for payment page polling."""
-    invoice_doc = await db.invoices.find_one({"id": order_id})
-    if not invoice_doc:
-        raise HTTPException(status_code=404, detail="Order not found")
-    status = invoice_doc.get("status", "pending")
-    expires_at_ms = _invoice_payment_deadline_ms(invoice_doc)
-    is_expired = status == "expired"
-    if not is_expired and expires_at_ms and expires_at_ms <= int(
-        datetime.now(timezone.utc).timestamp() * 1000
-    ):
-        is_expired = True
-
-    amount_due = float(invoice_doc.get("amount_due", 0.0) or 0.0)
-    amount_paid = float(invoice_doc.get("amount_paid", 0.0) or 0.0)
-
-    return {
-        "orderId": order_id,
-        "status": status,
-        "isPaid": status == "paid",
-        "isExpired": is_expired,
-        "expiresAtMs": expires_at_ms,
-        "amount": amount_due,
-        "amountPaid": amount_paid,
-        "amountRemaining": max(0.0, amount_due - amount_paid),
-        "address": invoice_doc.get("address"),
-        "txid": invoice_doc.get("txid"),
-        "backUrl": invoice_doc.get("back_url"),
-    }
 
 
 @app.get("/health")
